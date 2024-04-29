@@ -3,10 +3,12 @@ import json
 import socket
 import subprocess
 import sys
+import threading
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import smtplib
 from pathlib import Path
+from typing import IO
 
 
 class Sender:
@@ -34,13 +36,49 @@ class Sender:
         server.quit()
 
 
+class StreamThread(threading.Thread):
+    def __init__(self, stream: IO[bytes], out_stream: IO[bytes]):
+        super().__init__(daemon=True)
+        self._stream = stream
+        self._out_stream = out_stream
+        self.captured = b""
+
+    def run(self):
+        while True:
+            line = self._stream.readline(16 * 1024)
+            if not line:
+                break
+            self._out_stream.write(line)
+            self._out_stream.flush()
+            self.captured += line
+
+
 def run_command(sender: Sender, command: list[str]):
-    try:
-        result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        return True, result.stdout
-    except subprocess.CalledProcessError as e:
-        print("Command failed, sending email", file=sys.stderr)
-        sender.send("Command Failed", f"Cmd '{' '.join(command)}' failed.\n\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}")
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout_thread = StreamThread(stream=process.stdout, out_stream=sys.stdout.buffer)
+    stderr_thread = StreamThread(stream=process.stderr, out_stream=sys.stderr.buffer)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    exit_code = process.wait()
+
+    stdout_thread.join()
+    stderr_thread.join()
+
+    if exit_code != 0:
+        print(f"\n\n--Command failed, exit code {exit_code}, sending email", file=sys.stderr)
+        try:
+            stdout = stdout_thread.captured.decode()
+        except UnicodeDecodeError as err:
+            stdout = f">>>Error decoding stdout ({err})<<<<\n\nbinary:\n{stdout_thread.captured}"
+        try:
+            stderr = stderr_thread.captured.decode()
+        except UnicodeDecodeError as err:
+            stderr = f">>>>Error decoding stderr ({err})<<<<\n\nbinary:\n{stderr_thread.captured}"
+        sender.send(
+            "Command Failed",
+            f"Cmd '{' '.join(command)}' exit code {exit_code}.\n\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}",
+        )
 
 
 def main():
